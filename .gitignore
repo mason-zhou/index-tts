@@ -29,3 +29,7 @@ desktop.ini
 /checkpoints/*
 !/checkpoints/*.yaml
 /outputs/
+
+# Custom.
+/logs/
+input.txt
