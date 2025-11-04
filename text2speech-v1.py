@@ -1,6 +1,6 @@
 """
 TTS 批量处理脚本
-功能：读取 input.txt 文件，逐行生成语音文件，并生成处理报告
+功能：读取 input.txt 文件，根据配置选择逐行生成语音文件或整文本生成一个语音文件，并生成处理报告
 """
 
 import os
@@ -20,7 +20,8 @@ class TTSBatchProcessor:
                  use_fp16=True, 
                  use_cuda_kernel=False, 
                  use_deepspeed=False,
-                 start_line_num=1):
+                 start_line_num=1,
+                 read_by_line=True):
         """
         初始化 TTS 批量处理器
         
@@ -32,6 +33,7 @@ class TTSBatchProcessor:
             use_cuda_kernel: 是否使用 CUDA 内核
             use_deepspeed: 是否使用 DeepSpeed
             start_line_num: 输出文件的起始编号，默认为1
+            read_by_line: 是否按行读取，True为逐行生成音频文件，False为整文本生成一个音频文件
         """
         # 初始化 TTS 模型
         self.tts = IndexTTS2(
@@ -68,6 +70,7 @@ class TTSBatchProcessor:
         self.processing_records = []
         self.total_start_time = None
         self.start_line_num = start_line_num
+        self.read_by_line = read_by_line
         
     def log_print(self, message, end='\n'):
         """
@@ -118,13 +121,14 @@ class TTSBatchProcessor:
             self.log_print(f"警告: 无法读取音频文件 {audio_path} 的时长: {e}")
             return 0.0
     
-    def generate_output_filename(self, line_num, text):
+    def generate_output_filename(self, line_num, text, is_full_text=False):
         """
         生成输出文件名
         
         参数:
-            line_num: 行号
+            line_num: 行号（整文本模式下不使用）
             text: 文本内容
+            is_full_text: 是否为整文本模式
             
         返回:
             输出文件名和完整路径
@@ -133,8 +137,15 @@ class TTSBatchProcessor:
         text_prefix = text[:10]
         # 清理文件名
         safe_prefix = self.sanitize_filename(text_prefix)
-        # 生成输出文件名：行号 + 前10个字符
-        output_filename = f"{line_num}_{safe_prefix}.wav"
+        
+        if is_full_text:
+            # 整文本模式：使用时间戳 + 文本前缀
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_filename = f"full_text_{timestamp}_{safe_prefix}.wav"
+        else:
+            # 按行模式：行号 + 前10个字符
+            output_filename = f"{line_num}_{safe_prefix}.wav"
+        
         output_path = os.path.join(self.output_dir, output_filename)
         return output_filename, output_path
     
@@ -150,7 +161,7 @@ class TTSBatchProcessor:
             处理记录字典，包含行号、字符数、处理时间、音频时长等信息
         """
         # 生成输出文件名
-        output_filename, output_path = self.generate_output_filename(line_num, text)
+        output_filename, output_path = self.generate_output_filename(line_num, text, is_full_text=False)
         
         # 统计当前行的字符数量（包括标点符号）
         char_count = len(text)
@@ -189,6 +200,58 @@ class TTSBatchProcessor:
         
         # 输出完成信息
         self.log_print(f"已完成: {output_filename} 处理时间: {line_elapsed:.2f} 秒\n")
+        
+        return record
+    
+    def process_full_text(self, text):
+        """
+        处理整文本，生成一个完整的音频文件
+        
+        参数:
+            text: 完整文本内容
+            
+        返回:
+            处理记录字典，包含字符数、处理时间、音频时长等信息
+        """
+        # 生成输出文件名
+        output_filename, output_path = self.generate_output_filename(0, text, is_full_text=True)
+        
+        # 统计字符数量
+        char_count = len(text)
+        self.total_char_count = char_count
+        
+        # 输出处理信息
+        self.log_print(f"正在处理完整文本: {text[:50]}...字符数量: {char_count} 个")
+        self.log_print(f"输出文件: {output_filename}")
+        
+        # 记录开始处理的时间
+        start_time = time.time()
+        
+        # 调用 TTS 生成音频
+        self.tts.infer(
+            spk_audio_prompt=self.spk_audio_prompt,
+            text=text,
+            output_path=output_path,
+            verbose=True
+        )
+        
+        # 计算处理时间
+        end_time = time.time()
+        elapsed = end_time - start_time
+        
+        # 获取生成的音频文件时长
+        audio_duration = self.get_audio_duration(output_path)
+        
+        # 构建处理记录
+        record = {
+            'line_num': '完整文本',
+            'char_count': char_count,
+            'elapsed_time': elapsed,
+            'audio_duration': audio_duration
+        }
+        
+        # 输出完成信息
+        self.log_print(f"已完成: {output_filename} 处理时间: {elapsed:.2f} 秒\n")
         
         return record
     
@@ -288,7 +351,7 @@ class TTSBatchProcessor:
     
     def process_batch(self):
         """
-        批量处理主函数：读取输入文件并逐行处理
+        批量处理主函数：根据 read_by_line 参数决定处理方式
         """
         # 记录总开始时间
         self.total_start_time = time.time()
@@ -296,20 +359,49 @@ class TTSBatchProcessor:
         # 输出日志头部信息
         self.print_log_header()
         
-        # 读取 input.txt 并逐行处理
-        with open(self.input_file, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, start=1):
-                text = line.strip()
-                if not text:  # 跳过空行
-                    continue
+        if self.read_by_line:
+            # 按行读取模式：逐行处理，每行生成一个音频文件
+            self.log_print("处理模式: 按行读取（每行生成一个音频文件）")
+            self.log_print("")
+            
+            with open(self.input_file, 'r', encoding='utf-8') as f:
+                line_counter = 0
+                for line in f:
+                    text = line.strip()
+                    if not text:  # 跳过空行
+                        continue
+                    
+                    line_counter += 1
+                    # 计算实际输出文件编号（从start_line_num开始）
+                    output_line_num = self.start_line_num + (line_counter - 1)
+                    
+                    # 处理单行文本
+                    record = self.process_single_line(output_line_num, text)
+                    # 保存处理记录
+                    self.processing_records.append(record)
+        else:
+            # 整文本读取模式：读取整个文件，忽略换行，生成一个音频文件
+            self.log_print("处理模式: 整文本读取（生成一个完整音频文件）")
+            self.log_print("")
+            
+            # 读取整个文件内容，忽略换行回车
+            with open(self.input_file, 'r', encoding='utf-8') as f:
+                lines = []
+                for line in f:
+                    stripped_line = line.strip()
+                    if stripped_line:  # 只添加非空行
+                        lines.append(stripped_line)
                 
-                # 计算实际输出文件编号（从start_line_num开始）
-                output_line_num = self.start_line_num + (line_num - 1)
-                
-                # 处理单行文本
-                record = self.process_single_line(output_line_num, text)
+                # 将所有行合并成一个文本（用空格连接，也可以不用分隔符）
+                full_text = ' '.join(lines)
+            
+            if full_text:
+                # 处理整文本
+                record = self.process_full_text(full_text)
                 # 保存处理记录
                 self.processing_records.append(record)
+            else:
+                self.log_print("警告: 输入文件为空，无法生成音频文件")
         
         # 计算总处理时间
         total_end_time = time.time()
@@ -328,8 +420,14 @@ def main():
     """
     主函数：程序入口点
     """
+    # 定义是否按行读取
+    # True: 每读取一行，生成一个对应的音频文件
+    # False: 读取整个输入文本，忽略换行回车，生成一个完整的大音频文件
+    read_by_line = False
+    
     # 定义输出文件的起始编号，初始值为1
     # 如果改为10，则第一行文本输出的文件名前缀从10开始编号，依次类推
+    # 注意：仅在 read_by_line=True 时有效
     start_line_num = 1
     
     # 创建 TTS 批量处理器实例
@@ -340,7 +438,8 @@ def main():
         use_fp16=False,
         use_cuda_kernel=False,
         use_deepspeed=False,
-        start_line_num=start_line_num
+        start_line_num=start_line_num,
+        read_by_line=read_by_line
     )
     
     # 执行批量处理
